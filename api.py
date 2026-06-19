@@ -8,18 +8,19 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI, File, UploadFile, HTTPException, Response
 from fastapi.responses import JSONResponse
 import torch
-from pydub import AudioSegment
 from faster_whisper import WhisperModel, BatchedInferencePipeline
 
 # ==================== CONFIGURAÇÕES ====================
 MODEL_TYPE = os.getenv("MODEL_TYPE", "parakeet")
 WHISPER_SIZE = os.getenv("WHISPER_SIZE", "large-v3-turbo")
-# PARAKEET_MODEL_FILE: caminho absoluto para o arquivo .nemo dentro da imagem
 PARAKEET_MODEL_FILE = os.getenv("PARAKEET_MODEL_FILE", "/app/model_cache/parakeet-tdt-0.6b-v3.nemo")
 BATCH_TIMEOUT = float(os.getenv("BATCH_TIMEOUT", "0.03"))
 MAX_BATCH_SIZE = int(os.getenv("MAX_BATCH_SIZE", "8"))
 DEVICE = os.getenv("DEVICE", "cuda" if torch.cuda.is_available() else "cpu")
 COMPUTE_TYPE = os.getenv("COMPUTE_TYPE", "float16" if DEVICE == "cuda" else "int8")
+
+# Diretório para arquivos temporários: use RAM disk se existir e tiver espaço suficiente
+TEMP_DIR = "/dev/shm" if os.path.exists("/dev/shm") else "/tmp"
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s")
 logger = logging.getLogger("stt-api")
@@ -37,7 +38,6 @@ if MODEL_TYPE == "whisper":
 elif MODEL_TYPE == "parakeet":
     import nemo.collections.asr as nemo_asr
     logger.info(f"Carregando Parakeet do arquivo local: {PARAKEET_MODEL_FILE}")
-    # Carrega o modelo diretamente do arquivo .nemo, sem tocar na internet
     model = nemo_asr.models.EncDecHybridRNNTCTCBPEModel.restore_from(restore_path=PARAKEET_MODEL_FILE)
     model = model.to(DEVICE)
     model.eval()
@@ -122,52 +122,79 @@ async def live():
 async def health():
     return Response(status_code=200, content="healthy")
 
+def get_audio_duration_ffprobe(file_path: str) -> float:
+    """Obtém a duração do áudio (em segundos) usando ffprobe."""
+    cmd = [
+        "ffprobe", "-v", "error",
+        "-show_entries", "format=duration",
+        "-of", "default=noprint_wrappers=1:nokey=1",
+        file_path
+    ]
+    try:
+        proc = subprocess.run(cmd, capture_output=True, text=True)
+        if proc.returncode == 0 and proc.stdout.strip():
+            return float(proc.stdout.strip())
+        else:
+            raise RuntimeError(f"ffprobe falhou: {proc.stderr}")
+    except Exception as e:
+        raise RuntimeError(f"Erro ao obter duração do áudio: {e}")
+
 @app.post("/v1/listen")
 async def transcribe_audio(file: UploadFile = File(...)):
-    # Obtém a extensão do arquivo enviado (case insensitive)
     original_suffix = os.path.splitext(file.filename)[1].lower() or ".wav"
 
-    # Salva o arquivo original em um temporário
-    with tempfile.NamedTemporaryFile(delete=False, suffix=original_suffix) as tmp:
+    # Salva o arquivo original em diretório temporário (RAM se possível)
+    with tempfile.NamedTemporaryFile(delete=False, suffix=original_suffix, dir=TEMP_DIR) as tmp:
         content = await file.read()
         tmp.write(content)
         tmp_original_path = tmp.name
 
-    # Se o arquivo for WebM, converte para OGG (áudio apenas) usando ffmpeg
+    ogg_path = None  # Inicializa para uso no finally
+
+    # Se for WebM, converte para OGG de forma otimizada
     if original_suffix == ".webm":
-        with tempfile.NamedTemporaryFile(delete=False, suffix=".ogg") as ogg_tmp:
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".ogg", dir=TEMP_DIR) as ogg_tmp:
             ogg_path = ogg_tmp.name
         try:
+            # 1ª tentativa: copiar stream de áudio sem recodificar (remux)
             cmd = [
-                "ffmpeg", "-y", "-i", tmp_original_path,
-                "-vn", "-c:a", "libvorbis", ogg_path
+                "ffmpeg", "-nostdin", "-hide_banner", "-loglevel", "error",
+                "-y", "-i", tmp_original_path,
+                "-vn", "-c:a", "copy", ogg_path
             ]
             proc = subprocess.run(cmd, capture_output=True, text=True)
             if proc.returncode != 0:
-                raise RuntimeError(f"Falha na conversão de WebM para OGG: {proc.stderr}")
+                # Se falhar (codec incompatível), recodifica para Vorbis
+                logger.warning("Cópia direta de stream falhou, tentando recodificar para Vorbis")
+                cmd = [
+                    "ffmpeg", "-nostdin", "-hide_banner", "-loglevel", "error",
+                    "-y", "-i", tmp_original_path,
+                    "-vn", "-c:a", "libvorbis", ogg_path
+                ]
+                proc = subprocess.run(cmd, capture_output=True, text=True)
+                if proc.returncode != 0:
+                    raise RuntimeError(f"Falha na conversão de WebM para OGG: {proc.stderr}")
         except Exception as e:
-            # Em caso de erro, remove os arquivos temporários
             os.unlink(tmp_original_path)
             if os.path.exists(ogg_path):
                 os.unlink(ogg_path)
             raise HTTPException(status_code=400, detail=f"Erro ao converter .webm: {str(e)}")
 
-        # Define o caminho do áudio convertido para uso no restante do fluxo
+        # Define o caminho do áudio convertido
         audio_path = ogg_path
     else:
         audio_path = tmp_original_path
-        ogg_path = None  # nenhum arquivo OGG gerado
 
     try:
-        # Carrega o áudio com pydub para obter a duração
-        audio = AudioSegment.from_file(audio_path)
-        duration = len(audio) / 1000.0
+        # Obtém duração via ffprobe (rápido, sem decodificar)
+        duration = get_audio_duration_ffprobe(audio_path)
     except Exception as e:
+        # Limpa temporários em caso de erro na leitura da duração
         if os.path.exists(tmp_original_path):
             os.unlink(tmp_original_path)
         if ogg_path and os.path.exists(ogg_path):
             os.unlink(ogg_path)
-        raise HTTPException(status_code=400, detail=f"Erro ao ler arquivo de áudio: {str(e)}")
+        raise HTTPException(status_code=400, detail=f"Erro ao obter duração do áudio: {str(e)}")
 
     # Coloca na fila de batch para transcrição
     loop = asyncio.get_event_loop()
