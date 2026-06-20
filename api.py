@@ -19,7 +19,7 @@ MAX_BATCH_SIZE = int(os.getenv("MAX_BATCH_SIZE", "8"))
 DEVICE = os.getenv("DEVICE", "cuda" if torch.cuda.is_available() else "cpu")
 COMPUTE_TYPE = os.getenv("COMPUTE_TYPE", "float16" if DEVICE == "cuda" else "int8")
 
-# Diretório para arquivos temporários: use RAM disk se existir e tiver espaço suficiente
+# Diretório para arquivos temporários: RAM disk se existir
 TEMP_DIR = "/dev/shm" if os.path.exists("/dev/shm") else "/tmp"
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s")
@@ -47,7 +47,7 @@ elif MODEL_TYPE == "parakeet":
 else:
     raise ValueError(f"MODEL_TYPE inválido: {MODEL_TYPE}")
 
-# ==================== FILA DE BATCH ====================
+# ==================== FILA DE BATCH (sem duração) ====================
 request_queue = asyncio.Queue()
 
 async def batch_worker():
@@ -64,8 +64,7 @@ async def batch_worker():
                 break
 
         futures = [item[0] for item in batch]
-        paths = [item[1] for item in batch]
-        durations = [item[2] for item in batch]
+        paths = [item[1] for item in batch]  # a tupla agora é (future, path)
 
         try:
             start_time = time.perf_counter()
@@ -79,10 +78,8 @@ async def batch_worker():
                 results = [hyp.text for hyp in hypotheses]
             end_time = time.perf_counter()
 
-            for idx, (path, dur) in enumerate(zip(paths, durations)):
-                per_audio_time = (end_time - start_time) / len(paths)
-                rtf = per_audio_time / dur if dur > 0 else 0
-                logger.info(f"RTF para {os.path.basename(path)}: {rtf:.4f} (tempo estimado: {per_audio_time:.3f}s, duração: {dur:.3f}s)")
+            per_audio_time = (end_time - start_time) / len(paths)
+            logger.info(f"Lote de {len(paths)} áudios processado em {end_time - start_time:.3f}s (média por áudio: {per_audio_time:.3f}s)")
 
             for future, text in zip(futures, results):
                 future.set_result(text)
@@ -91,7 +88,7 @@ async def batch_worker():
             for future in futures:
                 future.set_exception(e)
         finally:
-            for _, tmp_path, _ in batch:
+            for _, tmp_path in batch:
                 try:
                     os.unlink(tmp_path)
                 except Exception:
@@ -122,41 +119,24 @@ async def live():
 async def health():
     return Response(status_code=200, content="healthy")
 
-def get_audio_duration_ffprobe(file_path: str) -> float:
-    """Obtém a duração do áudio (em segundos) usando ffprobe."""
-    cmd = [
-        "ffprobe", "-v", "error",
-        "-show_entries", "format=duration",
-        "-of", "default=noprint_wrappers=1:nokey=1",
-        file_path
-    ]
-    try:
-        proc = subprocess.run(cmd, capture_output=True, text=True)
-        if proc.returncode == 0 and proc.stdout.strip():
-            return float(proc.stdout.strip())
-        else:
-            raise RuntimeError(f"ffprobe falhou: {proc.stderr}")
-    except Exception as e:
-        raise RuntimeError(f"Erro ao obter duração do áudio: {e}")
-
 @app.post("/v1/listen")
 async def transcribe_audio(file: UploadFile = File(...)):
     original_suffix = os.path.splitext(file.filename)[1].lower() or ".wav"
 
-    # Salva o arquivo original em diretório temporário (RAM se possível)
+    # Salva o arquivo original em RAM se possível
     with tempfile.NamedTemporaryFile(delete=False, suffix=original_suffix, dir=TEMP_DIR) as tmp:
         content = await file.read()
         tmp.write(content)
         tmp_original_path = tmp.name
 
-    ogg_path = None  # Inicializa para uso no finally
+    ogg_path = None
 
-    # Se for WebM, converte para OGG de forma otimizada
+    # Se for WebM, converte para OGG de forma otimizada (remux preferencial)
     if original_suffix == ".webm":
         with tempfile.NamedTemporaryFile(delete=False, suffix=".ogg", dir=TEMP_DIR) as ogg_tmp:
             ogg_path = ogg_tmp.name
         try:
-            # 1ª tentativa: copiar stream de áudio sem recodificar (remux)
+            # Tenta copiar a stream de áudio sem recodificar
             cmd = [
                 "ffmpeg", "-nostdin", "-hide_banner", "-loglevel", "error",
                 "-y", "-i", tmp_original_path,
@@ -165,7 +145,7 @@ async def transcribe_audio(file: UploadFile = File(...)):
             proc = subprocess.run(cmd, capture_output=True, text=True)
             if proc.returncode != 0:
                 # Se falhar (codec incompatível), recodifica para Vorbis
-                logger.warning("Cópia direta de stream falhou, tentando recodificar para Vorbis")
+                logger.warning("Cópia direta de stream falhou, recodificando para Vorbis")
                 cmd = [
                     "ffmpeg", "-nostdin", "-hide_banner", "-loglevel", "error",
                     "-y", "-i", tmp_original_path,
@@ -179,27 +159,14 @@ async def transcribe_audio(file: UploadFile = File(...)):
             if os.path.exists(ogg_path):
                 os.unlink(ogg_path)
             raise HTTPException(status_code=400, detail=f"Erro ao converter .webm: {str(e)}")
-
-        # Define o caminho do áudio convertido
         audio_path = ogg_path
     else:
         audio_path = tmp_original_path
 
-    try:
-        # Obtém duração via ffprobe (rápido, sem decodificar)
-        duration = get_audio_duration_ffprobe(audio_path)
-    except Exception as e:
-        # Limpa temporários em caso de erro na leitura da duração
-        if os.path.exists(tmp_original_path):
-            os.unlink(tmp_original_path)
-        if ogg_path and os.path.exists(ogg_path):
-            os.unlink(ogg_path)
-        raise HTTPException(status_code=400, detail=f"Erro ao obter duração do áudio: {str(e)}")
-
-    # Coloca na fila de batch para transcrição
+    # Enfileira para transcrição (sem duração)
     loop = asyncio.get_event_loop()
     future = loop.create_future()
-    await request_queue.put((future, audio_path, duration))
+    await request_queue.put((future, audio_path))
 
     try:
         transcript = await asyncio.wait_for(future, timeout=60.0)
@@ -216,7 +183,6 @@ async def transcribe_audio(file: UploadFile = File(...)):
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
     finally:
-        # Garante que todos os arquivos temporários sejam removidos
         if os.path.exists(tmp_original_path):
             os.unlink(tmp_original_path)
         if ogg_path and os.path.exists(ogg_path):
