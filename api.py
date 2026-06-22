@@ -5,15 +5,13 @@ import logging
 import time
 import subprocess
 from contextlib import asynccontextmanager
-
 from fastapi import FastAPI, File, UploadFile, HTTPException, Response
 from fastapi.responses import JSONResponse
-
 import torch
 from faster_whisper import WhisperModel, BatchedInferencePipeline
 
 # ==================== CONFIGURAÇÕES ====================
-MODEL_TYPE = os.getenv("MODEL_TYPE", "parakeet")           # "whisper" ou "parakeet"
+MODEL_TYPE = os.getenv("MODEL_TYPE", "parakeet")
 WHISPER_SIZE = os.getenv("WHISPER_SIZE", "large-v3-turbo")
 PARAKEET_MODEL_FILE = os.getenv("PARAKEET_MODEL_FILE", "/app/model_cache/parakeet-tdt-0.6b-v3.nemo")
 BATCH_TIMEOUT = float(os.getenv("BATCH_TIMEOUT", "0.03"))
@@ -21,49 +19,14 @@ MAX_BATCH_SIZE = int(os.getenv("MAX_BATCH_SIZE", "8"))
 DEVICE = os.getenv("DEVICE", "cuda" if torch.cuda.is_available() else "cpu")
 COMPUTE_TYPE = os.getenv("COMPUTE_TYPE", "float16" if DEVICE == "cuda" else "int8")
 
-# Diretório para arquivos temporários (RAM disk se existir)
+# Diretório para arquivos temporários: RAM disk se existir
 TEMP_DIR = "/dev/shm" if os.path.exists("/dev/shm") else "/tmp"
 
-# Configuração de logging (nível DEBUG para diagnóstico)
-logging.basicConfig(
-    level=logging.DEBUG,
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
-)
+logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s")
 logger = logging.getLogger("stt-api")
-
-# ==================== FUNÇÃO AUXILIAR PARA INSPECIONAR ÁUDIO ====================
-def log_audio_info(filepath: str, label: str = "Áudio"):
-    """Usa ffprobe para obter e logar informações detalhadas do arquivo."""
-    cmd = [
-        "ffprobe", "-v", "error",
-        "-show_entries", "stream=codec_name,channels,sample_rate,duration",
-        "-of", "default=noprint_wrappers=1",
-        filepath
-    ]
-    try:
-        output = subprocess.check_output(cmd, stderr=subprocess.STDOUT, text=True)
-        logger.debug(f"[{label}] Informações do arquivo {filepath}:\n{output}")
-        # Extrai valores para log mais legível
-        info = {}
-        for line in output.splitlines():
-            if "=" in line:
-                k, v = line.split("=", 1)
-                info[k] = v
-        if info:
-            logger.debug(
-                f"[{label}] Resumo: codec={info.get('codec_name')}, "
-                f"canais={info.get('channels')}, taxa={info.get('sample_rate')} Hz, "
-                f"duração={info.get('duration')}s"
-            )
-    except subprocess.CalledProcessError as e:
-        logger.warning(f"[{label}] Falha ao obter info com ffprobe: {e.output}")
 
 # ==================== CARREGAMENTO DO MODELO ====================
 logger.info(f"Dispositivo: {DEVICE}, Modelo: {MODEL_TYPE}")
-logger.info(f"MODEL_TYPE={MODEL_TYPE}, WHISPER_SIZE={WHISPER_SIZE}, "
-            f"PARAKEET_MODEL_FILE={PARAKEET_MODEL_FILE}")
-logger.info(f"DEVICE={DEVICE}, COMPUTE_TYPE={COMPUTE_TYPE}, "
-            f"BATCH_TIMEOUT={BATCH_TIMEOUT}, MAX_BATCH_SIZE={MAX_BATCH_SIZE}")
 
 if MODEL_TYPE == "whisper":
     logger.info(f"Carregando Whisper '{WHISPER_SIZE}'...")
@@ -73,14 +36,9 @@ if MODEL_TYPE == "whisper":
     logger.info("Whisper pronto.")
 
 elif MODEL_TYPE == "parakeet":
-    try:
-        import nemo.collections.asr as nemo_asr
-    except ImportError:
-        raise ImportError("NeMo não está instalado. Execute: pip install nemo_toolkit[asr]")
+    import nemo.collections.asr as nemo_asr
     logger.info(f"Carregando Parakeet do arquivo local: {PARAKEET_MODEL_FILE}")
-    model = nemo_asr.models.EncDecHybridRNNTCTCBPEModel.restore_from(
-        restore_path=PARAKEET_MODEL_FILE
-    )
+    model = nemo_asr.models.EncDecHybridRNNTCTCBPEModel.restore_from(restore_path=PARAKEET_MODEL_FILE)
     model = model.to(DEVICE)
     model.eval()
     MODEL_LOADED = True
@@ -89,11 +47,10 @@ elif MODEL_TYPE == "parakeet":
 else:
     raise ValueError(f"MODEL_TYPE inválido: {MODEL_TYPE}")
 
-# ==================== FILA DE BATCH ====================
+# ==================== FILA DE BATCH (sem duração) ====================
 request_queue = asyncio.Queue()
 
 async def batch_worker():
-    """Worker que processa lotes de áudios (todos já em WAV mono 16kHz)."""
     while True:
         batch = []
         first = await request_queue.get()
@@ -107,53 +64,35 @@ async def batch_worker():
                 break
 
         futures = [item[0] for item in batch]
-        paths = [item[1] for item in batch]   # caminhos dos arquivos WAV
-
-        logger.info(f"Processando lote com {len(paths)} arquivos: {paths}")
+        paths = [item[1] for item in batch]  # a tupla agora é (future, path)
 
         try:
             start_time = time.perf_counter()
-
-            # Log detalhado de cada arquivo do lote (opcional, mas útil)
-            for p in paths:
-                log_audio_info(p, f"Lote-{id(batch)}")
-
             if MODEL_TYPE == "whisper":
                 results = []
                 for path in paths:
-                    logger.debug(f"Transcrevendo com Whisper: {path}")
                     segments, _ = model.transcribe(path, language="pt", task="transcribe")
                     results.append(" ".join(seg.text for seg in segments).strip())
-            else:  # Parakeet
-                logger.debug(f"Transcrevendo lote com Parakeet: {paths}")
-                # Parakeet aceita lista de caminhos
+            else:
                 hypotheses = model.transcribe(paths)
                 results = [hyp.text for hyp in hypotheses]
-
             end_time = time.perf_counter()
+
             per_audio_time = (end_time - start_time) / len(paths)
-            logger.info(
-                f"Lote de {len(paths)} áudios processado em {end_time - start_time:.3f}s "
-                f"(média por áudio: {per_audio_time:.3f}s)"
-            )
+            logger.info(f"Lote de {len(paths)} áudios processado em {end_time - start_time:.3f}s (média por áudio: {per_audio_time:.3f}s)")
 
             for future, text in zip(futures, results):
                 future.set_result(text)
-                logger.debug(f"Resultado definido: {text[:30]}...")
-
         except Exception as e:
             logger.exception("Erro na transcrição em lote")
             for future in futures:
                 future.set_exception(e)
         finally:
-            # Remove os arquivos temporários (já convertidos para WAV)
             for _, tmp_path in batch:
                 try:
-                    if os.path.exists(tmp_path):
-                        os.unlink(tmp_path)
-                        logger.debug(f"Arquivo temporário removido pelo worker: {tmp_path}")
-                except Exception as e:
-                    logger.warning(f"Falha ao remover {tmp_path}: {e}")
+                    os.unlink(tmp_path)
+                except Exception:
+                    pass
 
 # ==================== FASTAPI ====================
 @asynccontextmanager
@@ -170,10 +109,7 @@ async def started():
 
 @app.get("/ready")
 async def ready():
-    if MODEL_LOADED:
-        return Response(status_code=200, content="ready")
-    else:
-        return Response(status_code=503, content="loading")
+    return Response(status_code=200, content="ready") if MODEL_LOADED else Response(status_code=503, content="loading")
 
 @app.get("/live")
 async def live():
@@ -185,72 +121,55 @@ async def health():
 
 @app.post("/v1/listen")
 async def transcribe_audio(file: UploadFile = File(...)):
-    """
-    Recebe um arquivo de áudio (qualquer formato suportado pelo ffmpeg),
-    converte para WAV mono 16kHz e enfileira para transcrição.
-    """
-    logger.info(f"Recebido arquivo: {file.filename}, tamanho: {file.size}, tipo: {file.content_type}")
-
     original_suffix = os.path.splitext(file.filename)[1].lower() or ".wav"
-    content = await file.read()
-    logger.debug(f"Conteúdo lido: {len(content)} bytes")
 
-    # Salva o arquivo original em disco (RAM se possível)
+    # Salva o arquivo original em RAM se possível
     with tempfile.NamedTemporaryFile(delete=False, suffix=original_suffix, dir=TEMP_DIR) as tmp:
+        content = await file.read()
         tmp.write(content)
         tmp_original_path = tmp.name
-    logger.debug(f"Arquivo original salvo em: {tmp_original_path}")
-    log_audio_info(tmp_original_path, "Original")
 
-    # Cria um arquivo WAV de saída (sempre .wav)
-    with tempfile.NamedTemporaryFile(delete=False, suffix=".wav", dir=TEMP_DIR) as wav_tmp:
-        wav_path = wav_tmp.name
+    ogg_path = None
 
-    # Comando ffmpeg para converter para WAV mono 16kHz
-    cmd = [
-        "ffmpeg", "-nostdin", "-hide_banner", "-loglevel", "error",
-        "-y", "-i", tmp_original_path,
-        "-ac", "1",           # mono
-        "-ar", "16000",       # 16 kHz
-        "-f", "wav",          # formato WAV
-        wav_path
-    ]
-    logger.debug(f"Executando conversão: {' '.join(cmd)}")
-    start_conv = time.perf_counter()
+    # Se for WebM, converte para OGG de forma otimizada (remux preferencial)
+    if original_suffix == ".webm":
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".ogg", dir=TEMP_DIR) as ogg_tmp:
+            ogg_path = ogg_tmp.name
+        try:
+            # Tenta copiar a stream de áudio sem recodificar
+            cmd = [
+                "ffmpeg", "-nostdin", "-hide_banner", "-loglevel", "error",
+                "-y", "-i", tmp_original_path,
+                "-vn", "-c:a", "copy", ogg_path
+            ]
+            proc = subprocess.run(cmd, capture_output=True, text=True)
+            if proc.returncode != 0:
+                # Se falhar (codec incompatível), recodifica para Vorbis
+                logger.warning("Cópia direta de stream falhou, recodificando para Vorbis")
+                cmd = [
+                    "ffmpeg", "-nostdin", "-hide_banner", "-loglevel", "error",
+                    "-y", "-i", tmp_original_path,
+                    "-vn", "-c:a", "libvorbis", ogg_path
+                ]
+                proc = subprocess.run(cmd, capture_output=True, text=True)
+                if proc.returncode != 0:
+                    raise RuntimeError(f"Falha na conversão de WebM para OGG: {proc.stderr}")
+        except Exception as e:
+            os.unlink(tmp_original_path)
+            if os.path.exists(ogg_path):
+                os.unlink(ogg_path)
+            raise HTTPException(status_code=400, detail=f"Erro ao converter .webm: {str(e)}")
+        audio_path = ogg_path
+    else:
+        audio_path = tmp_original_path
 
-    try:
-        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
-        if proc.returncode != 0:
-            logger.error(f"ffmpeg falhou (código {proc.returncode}): {proc.stderr}")
-            raise RuntimeError(f"Falha na conversão: {proc.stderr}")
-        elapsed = time.perf_counter() - start_conv
-        logger.debug(f"Conversão concluída em {elapsed:.3f}s")
-    except Exception as e:
-        logger.exception("Exceção durante conversão")
-        os.unlink(tmp_original_path)
-        if os.path.exists(wav_path):
-            os.unlink(wav_path)
-        raise HTTPException(status_code=400, detail=f"Erro ao converter áudio: {str(e)}")
-
-    # Inspeciona o WAV gerado
-    log_audio_info(wav_path, "WAV convertido")
-
-    # Remove o arquivo original (já convertido)
-    try:
-        os.unlink(tmp_original_path)
-        logger.debug(f"Arquivo original removido: {tmp_original_path}")
-    except Exception as e:
-        logger.warning(f"Não foi possível remover original {tmp_original_path}: {e}")
-
-    # Enfileira para transcrição
+    # Enfileira para transcrição (sem duração)
     loop = asyncio.get_event_loop()
     future = loop.create_future()
-    await request_queue.put((future, wav_path))
-    logger.info(f"Áudio enfileirado para transcrição: {wav_path}")
+    await request_queue.put((future, audio_path))
 
     try:
         transcript = await asyncio.wait_for(future, timeout=60.0)
-        logger.info(f"Transcrição concluída: '{transcript[:50]}...'")
         response = {
             "results": {
                 "channels": [{
@@ -260,17 +179,11 @@ async def transcribe_audio(file: UploadFile = File(...)):
         }
         return JSONResponse(content=response)
     except asyncio.TimeoutError:
-        logger.error(f"Timeout na transcrição para {wav_path}")
         raise HTTPException(status_code=504, detail="Transcrição expirou")
     except Exception as e:
-        logger.exception(f"Erro na transcrição para {wav_path}")
         raise HTTPException(status_code=500, detail=str(e))
     finally:
-        # Limpeza final (caso o worker não tenha removido por algum motivo)
-        for p in [tmp_original_path, wav_path]:
-            if os.path.exists(p):
-                try:
-                    os.unlink(p)
-                    logger.debug(f"Arquivo removido (finally): {p}")
-                except Exception as e:
-                    logger.warning(f"Não foi possível remover {p} no finally: {e}")
+        if os.path.exists(tmp_original_path):
+            os.unlink(tmp_original_path)
+        if ogg_path and os.path.exists(ogg_path):
+            os.unlink(ogg_path)
