@@ -1,14 +1,32 @@
 import os
+import sys
+import subprocess
+import logging
+
+# ==================== AUTO-INSTALAÇÃO DE DEPENDÊNCIAS ====================
+# Tenta importar librosa; se falhar, instala via pip
+try:
+    import librosa
+    import audioread  # opcional, mas garante suporte a webm/ogg
+except ImportError as e:
+    logging.basicConfig(level=logging.INFO)
+    logger = logging.getLogger("installer")
+    logger.warning(f"Dependência faltando: {e}. Instalando via pip...")
+    subprocess.check_call([sys.executable, "-m", "pip", "install", "librosa", "audioread"])
+    # Após a instalação, importa novamente
+    import librosa
+    import audioread
+    logger.info("Librosa e audioread instalados com sucesso.")
+
+# Agora segue o resto do código
 import asyncio
 import tempfile
-import logging
 import time
-import subprocess
 from contextlib import asynccontextmanager
 from fastapi import FastAPI, File, UploadFile, HTTPException, Response
 from fastapi.responses import JSONResponse
 import torch
-from faster_whisper import WhisperModel, BatchedInferencePipeline
+import numpy as np
 
 # ==================== CONFIGURAÇÕES ====================
 MODEL_TYPE = os.getenv("MODEL_TYPE", "parakeet")
@@ -29,6 +47,7 @@ logger = logging.getLogger("stt-api")
 logger.info(f"Dispositivo: {DEVICE}, Modelo: {MODEL_TYPE}")
 
 if MODEL_TYPE == "whisper":
+    from faster_whisper import WhisperModel, BatchedInferencePipeline
     logger.info(f"Carregando Whisper '{WHISPER_SIZE}'...")
     model = WhisperModel(WHISPER_SIZE, device=DEVICE, compute_type=COMPUTE_TYPE)
     model = BatchedInferencePipeline(model=model)
@@ -47,7 +66,7 @@ elif MODEL_TYPE == "parakeet":
 else:
     raise ValueError(f"MODEL_TYPE inválido: {MODEL_TYPE}")
 
-# ==================== FILA DE BATCH (sem duração) ====================
+# ==================== FILA DE BATCH ====================
 request_queue = asyncio.Queue()
 
 async def batch_worker():
@@ -64,25 +83,34 @@ async def batch_worker():
                 break
 
         futures = [item[0] for item in batch]
-        paths = [item[1] for item in batch]  # a tupla agora é (future, path)
+        paths = [item[1] for item in batch]
 
         try:
             start_time = time.perf_counter()
-            if MODEL_TYPE == "whisper":
-                results = []
-                for path in paths:
-                    segments, _ = model.transcribe(path, language="pt", task="transcribe")
-                    results.append(" ".join(seg.text for seg in segments).strip())
-            else:
-                hypotheses = model.transcribe(paths)
-                results = [hyp.text for hyp in hypotheses]
-            end_time = time.perf_counter()
 
+            # Carrega todos os áudios com librosa (força 16 kHz, mono)
+            audio_data = []
+            for path in paths:
+                y, sr = librosa.load(path, sr=16000, mono=True)
+                audio_data.append((y, sr))
+
+            if MODEL_TYPE == "whisper":
+                waveforms = [y for y, _ in audio_data]
+                segments_batch = model.transcribe(waveforms, language="pt", task="transcribe")
+                results = []
+                for segments in segments_batch:
+                    results.append(" ".join(seg.text for seg in segments).strip())
+            else:  # Parakeet
+                hypotheses = model.transcribe(audio_data)
+                results = [hyp.text for hyp in hypotheses]
+
+            end_time = time.perf_counter()
             per_audio_time = (end_time - start_time) / len(paths)
             logger.info(f"Lote de {len(paths)} áudios processado em {end_time - start_time:.3f}s (média por áudio: {per_audio_time:.3f}s)")
 
             for future, text in zip(futures, results):
                 future.set_result(text)
+
         except Exception as e:
             logger.exception("Erro na transcrição em lote")
             for future in futures:
@@ -123,47 +151,11 @@ async def health():
 async def transcribe_audio(file: UploadFile = File(...)):
     original_suffix = os.path.splitext(file.filename)[1].lower() or ".wav"
 
-    # Salva o arquivo original em RAM se possível
     with tempfile.NamedTemporaryFile(delete=False, suffix=original_suffix, dir=TEMP_DIR) as tmp:
         content = await file.read()
         tmp.write(content)
-        tmp_original_path = tmp.name
+        audio_path = tmp.name
 
-    ogg_path = None
-
-    # Se for WebM, converte para OGG de forma otimizada (remux preferencial)
-    if original_suffix == ".webm":
-        with tempfile.NamedTemporaryFile(delete=False, suffix=".ogg", dir=TEMP_DIR) as ogg_tmp:
-            ogg_path = ogg_tmp.name
-        try:
-            # Tenta copiar a stream de áudio sem recodificar
-            cmd = [
-                "ffmpeg", "-nostdin", "-hide_banner", "-loglevel", "error",
-                "-y", "-i", tmp_original_path,
-                "-vn", "-c:a", "copy", ogg_path
-            ]
-            proc = subprocess.run(cmd, capture_output=True, text=True)
-            if proc.returncode != 0:
-                # Se falhar (codec incompatível), recodifica para Vorbis
-                logger.warning("Cópia direta de stream falhou, recodificando para Vorbis")
-                cmd = [
-                    "ffmpeg", "-nostdin", "-hide_banner", "-loglevel", "error",
-                    "-y", "-i", tmp_original_path,
-                    "-vn", "-c:a", "libvorbis", ogg_path
-                ]
-                proc = subprocess.run(cmd, capture_output=True, text=True)
-                if proc.returncode != 0:
-                    raise RuntimeError(f"Falha na conversão de WebM para OGG: {proc.stderr}")
-        except Exception as e:
-            os.unlink(tmp_original_path)
-            if os.path.exists(ogg_path):
-                os.unlink(ogg_path)
-            raise HTTPException(status_code=400, detail=f"Erro ao converter .webm: {str(e)}")
-        audio_path = ogg_path
-    else:
-        audio_path = tmp_original_path
-
-    # Enfileira para transcrição (sem duração)
     loop = asyncio.get_event_loop()
     future = loop.create_future()
     await request_queue.put((future, audio_path))
@@ -183,7 +175,5 @@ async def transcribe_audio(file: UploadFile = File(...)):
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
     finally:
-        if os.path.exists(tmp_original_path):
-            os.unlink(tmp_original_path)
-        if ogg_path and os.path.exists(ogg_path):
-            os.unlink(ogg_path)
+        if os.path.exists(audio_path):
+            os.unlink(audio_path)
