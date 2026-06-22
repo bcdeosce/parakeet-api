@@ -4,21 +4,27 @@ import subprocess
 import logging
 
 # ==================== AUTO-INSTALAÇÃO DE DEPENDÊNCIAS ====================
-# Tenta importar librosa; se falhar, instala via pip
 try:
     import librosa
-    import audioread  # opcional, mas garante suporte a webm/ogg
+    import audioread
 except ImportError as e:
     logging.basicConfig(level=logging.INFO)
     logger = logging.getLogger("installer")
     logger.warning(f"Dependência faltando: {e}. Instalando via pip...")
     subprocess.check_call([sys.executable, "-m", "pip", "install", "librosa", "audioread"])
-    # Após a instalação, importa novamente
     import librosa
     import audioread
     logger.info("Librosa e audioread instalados com sucesso.")
 
-# Agora segue o resto do código
+# Opcional: instalar soundfile para evitar warning do PySoundFile
+try:
+    import soundfile
+except ImportError:
+    logging.warning("soundfile não encontrado. Instalando para melhor desempenho...")
+    subprocess.check_call([sys.executable, "-m", "pip", "install", "soundfile"])
+    import soundfile
+
+# Agora o resto do código
 import asyncio
 import tempfile
 import time
@@ -36,8 +42,6 @@ BATCH_TIMEOUT = float(os.getenv("BATCH_TIMEOUT", "0.03"))
 MAX_BATCH_SIZE = int(os.getenv("MAX_BATCH_SIZE", "8"))
 DEVICE = os.getenv("DEVICE", "cuda" if torch.cuda.is_available() else "cpu")
 COMPUTE_TYPE = os.getenv("COMPUTE_TYPE", "float16" if DEVICE == "cuda" else "int8")
-
-# Diretório para arquivos temporários: RAM disk se existir
 TEMP_DIR = "/dev/shm" if os.path.exists("/dev/shm") else "/tmp"
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s")
@@ -92,7 +96,7 @@ async def batch_worker():
             audio_data = []
             for path in paths:
                 y, sr = librosa.load(path, sr=16000, mono=True)
-                audio_data.append((y, sr))
+                audio_data.append((y, sr))  # mantemos a tupla para compatibilidade
 
             if MODEL_TYPE == "whisper":
                 waveforms = [y for y, _ in audio_data]
@@ -101,7 +105,10 @@ async def batch_worker():
                 for segments in segments_batch:
                     results.append(" ".join(seg.text for seg in segments).strip())
             else:  # Parakeet
-                hypotheses = model.transcribe(audio_data)
+                # Converte cada waveform para torch tensor (float32) e move para o device do modelo
+                waveforms = [torch.from_numpy(y).float().to(DEVICE) for y, _ in audio_data]
+                # Chama transcribe com sample_rate explícito
+                hypotheses = model.transcribe(waveforms, sample_rate=16000)
                 results = [hyp.text for hyp in hypotheses]
 
             end_time = time.perf_counter()
